@@ -1,0 +1,655 @@
+---
+title: "RNA-seq pathway analysis using Salmon and DESeq2"
+author: "Wenshu Chen"
+date: "2024-1-5"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(bitmapType="cairo")
+```
+
+This is a practice of RNA-seq pathway analysis using a small portion (6 out of 156) of GEO [GSE135378](https://www.ncbi.nlm.nih.gov/gds/?term=GSE135378[Accession]) dataset. Differential expression analysis was done with DESeq2. Pathway analysis was performed for GO ontology and MSigDb gene sets.
+
+Related paper: 
+Pappalardi MB, et al. https://doi.org/10.1038/s43018-021-00249-x
+
+The paper describes the discovery and systematic characterization of a novel small molecule DNA methyltransferase (DNMT) 1 inhibitor GSK3685032 and its anti-tumor activity in acute myeloid leukemia cell lines. Decitabine (DAC), a nucleoside analog and classic non-specific DNMT inhibitor, was used for comparison of the effects on DNA demethylation, transcription changes, DNA damage, and tumor inhibitory activity but not on specific gene expression. 
+
+In this version of exercise, we used Salmon to quantify original reads and obtained a count matrix.
+
+Original pair-ended reads from leukemia-derived macrophage cell line MV4-11 cells treated with 400 nM decitabine (DAC) or GSK3685032 (GSK in short hereafter) for 4 days together with vehicle (DMSO) control were downloaded from NCBI SRA. Each treatment has two set of replicates, each of which includes six samples (six SRRs). A set of reads were combined in Slamon to obtain a single count file (quant.sf). Therefore, the result was six count files, two for each condition (DMSO, GSK032, and DAC). The reads appeared to have high base quality as assessed with fastQC (not shown) and were used for quantification without further processing (e.g., adapter removal). Salmon reported the alignment rates were between 50% - 60%, expect one DMSO sample (slightly over 70%).
+
+SRA download and Salmon quantification was performed on Linux command line. See the repository for the scripts.
+
+[MSigDB gene sets](https://www.gsea-msigdb.org/gsea/msigdb) were download manually from the website.
+
+The results were consistent with broad effects of DNA demethylation. However, this is a technical practice not aiming to reproduce the original analyses or draw any biological insights.
+
+
+#### Load the libraries.  
+
+```{r library, message=FALSE, warning=FALSE}
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(EnsDb.Hsapiens.v86)
+library(DESeq2)
+library(tximport)
+library(apeglm)
+library(EDASeq)
+library(limma)
+library(clusterProfiler)
+library(fgsea)
+library(msigdbr)
+library(ReactomePA)
+library(vsn)
+library(hexbin)
+library(pheatmap)
+library(dplyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(RColorBrewer)
+library(Glimma)
+library(ggvenn)
+library(plotly)
+```
+
+## Data preparation  
+
+#### Prepare a tx2gene file
+
+Gene names in quant.sf are in ENSEMBL format, so we use EnsemblDb to prepare the file.
+
+```{r tx2gene}
+edb = EnsDb.Hsapiens.v86
+edb_transcripts = transcripts(edb, return.type = "DataFrame")
+edb_tx2gene = edb_transcripts[, c("tx_name", "gene_id")]
+#write.table(edb_tx2gene, "edb_tx2gene", row.names = FALSE, quote = FALSE)
+```
+
+#### Read in salmon counts and construct a DESeq dataset  
+
+We include batch in the design formula.  
+
+```{r quants}
+salmon_sample_info = read.table("salmon_sample_info.txt", header = TRUE)
+rownames(salmon_sample_info) = salmon_sample_info$sample
+salmon_sample_info$condition = factor(salmon_sample_info$condition)
+salmon_sample_info$batch = str_split_i(salmon_sample_info$sample, "_", 2)
+salmon_sample_info$batch = as.factor(salmon_sample_info$batch)
+
+quant_files = file.path(getwd(), "pappa-salmon-sf", paste0(salmon_sample_info$sample, "_quant.sf"))
+names(quant_files) <- salmon_sample_info$sample
+txi = tximport(quant_files, type="salmon", tx2gene=edb_tx2gene, ignoreTxVersion = TRUE)
+
+# Construct DESeq dataset
+ddsTxi <- DESeqDataSetFromTximport(txi,
+                                   colData = salmon_sample_info,
+                                   design = ~ batch + condition)
+```
+
+#### Filtering read count
+
+Filter the counts, removing low counts as recommended by the authors of DESeq. We include rows with at least two samples having count >= 10.
+
+```{r filtering_count}
+# We have 3 conditions, each with two replicates. 
+# Note that original authors set a much looser criterion (>= 2 reads) even with more samples.
+keep = rowSums(counts(ddsTxi) >= 10) >= 2
+sum(keep)  # 21700
+# Total rows: 39376, so 39376 - 21700 = 17676 removed.
+ddsTxi = ddsTxi[keep, ]
+```
+
+## Differential expression analysis
+
+#### DESeq task
+
+```{r DE}
+# Tell DESeq the reference level (control).
+# First check the condition.
+print(ddsTxi$condition)
+print(ddsTxi$batch)
+
+# Set the condition.
+ddsTxi$condition= factor(ddsTxi$condition, levels = c("DMSO", "DAC", "GSK"))
+print(ddsTxi$condition)
+
+# Generate the log fold change table.
+ddsTxi = DESeq(ddsTxi)
+print(ddsTxi)
+```
+
+#### Get the results for GSK and DAC.
+
+Significance level set to 0.05 as that from original authors.
+
+```{r result}
+res_GSK = results(ddsTxi, contrast = c("condition", "GSK", "DMSO"), alpha = 0.05)
+# Sort the rows by fold change.
+res_GSK = res_GSK[order(res_GSK$log2FoldChange, decreasing = TRUE), ]
+print(summary(res_GSK))
+```
+
+```{r}
+res_DAC = results(ddsTxi, contrast = c("condition", "DAC", "DMSO"), alpha = 0.05)
+# Sort the rows by fold change.
+res_DAC = res_DAC[order(res_DAC$log2FoldChange, decreasing = TRUE), ]
+print(summary(res_DAC))
+```
+#### Log fold change shrinkage
+
+For visualization and ranking according to DESeq authors.
+
+```{r log_fold_shrinkage, message=FALSE}
+lfcShrink_GSK = lfcShrink(ddsTxi, coef = "condition_GSK_vs_DMSO", type = "apeglm")
+lfcShrink_DAC = lfcShrink(ddsTxi, coef = "condition_DAC_vs_DMSO", type = "apeglm")
+```
+
+## Quality plots  
+
+We look at various plots for data quality. 
+
+#### MA-plot
+
+Most of the points (genes) are expected to be around the horizontal 0 line. True.
+
+```{r MA-plot_GSK}
+DESeq2::plotMA(lfcShrink_GSK, ylim = c(-3, 3))
+```
+
+```{r MA-plot_DAC}
+DESeq2::plotMA(lfcShrink_DAC, ylim = c(-3, 3))
+```
+
+#### P-value distribution
+
+Show expected results. 
+
+```{r pvalue}
+par(mfrow = c(1, 2))
+
+ggplot(res_GSK, aes(x = pvalue)) + geom_histogram(bins = 100) +
+    ggtitle("Distribution of raw p values") +
+    theme_classic()
+
+ggplot(res_DAC, aes(x = padj)) + geom_histogram(bins = 100) +
+        ggtitle("Distribution of raw p values") + 
+        theme_classic()
+```
+
+#### Raw and normalized counts
+
+Relative log expression plots. Normalization worked well.
+
+```{r RLE_plot}
+EDASeq::plotRLE(counts(ddsTxi), 
+        outline = FALSE, 
+        col = colData(ddsTxi)$condition,
+        ylim = c(-3, 3),
+        main = "Raw Counts")
+EDASeq::plotRLE(counts(ddsTxi, normalized = TRUE), 
+        outline = FALSE, 
+        col = colData(ddsTxi)$condition,
+        ylim = c(-3, 3),
+        main = "Normalized Counts")
+```
+
+#### Heatmaps of transformed count matrix
+
+Replicates have variations with a pattern that seems to suggest batch effect, but overall they were clustered together. 
+
+Normalized counts.
+
+```{r heatmap, normTransform}
+select = order(rowMeans(counts(ddsTxi, normalized = TRUE)), decreasing = TRUE)[1:100]
+col_df <- data.frame(colData(ddsTxi))["condition"]
+pheatmap(assay(normTransform(ddsTxi))[select, ], scale = "row", 
+         cluster_rows = FALSE, show_rownames = FALSE,
+         annotation_col = col_df)
+```
+
+Counts with regularized log transformation(rlog).
+
+```{r heatmap, rlog_transformation}
+rlogT = rlog(ddsTxi)
+pheatmap(assay(rlogT)[select, ], scale = "row", 
+         cluster_rows = FALSE, show_rownames = FALSE,
+         annotation_col = col_df)
+```
+
+Counts with variance_stabilizing transformation(vst).
+
+```{r heatmap, variance_stabilizing_transformation}
+vsd = vst(ddsTxi)
+pheatmap(assay(vsd)[select, ], scale = "row", 
+         cluster_rows = FALSE, show_rownames = FALSE,
+         annotation_col = col_df)
+```
+
+Use limma removeBatchBatchEffect to see if batch effect indeed exists.
+
+Hard to tell here, but clear in PCA plot (below).
+
+```{r batch_effect, with_limma}
+vsd2 = vsd
+mat = assay(vsd2)
+mmatrix = model.matrix(~ condition, colData(vsd2))
+mat = removeBatchEffect(mat, batch = vsd2$batch, design = mmatrix)
+assay(vsd2) = mat
+pheatmap(assay(vsd2)[select, ], scale = "row", 
+         cluster_rows = FALSE, show_rownames = FALSE,
+         annotation_col = col_df)
+```
+
+#### Count PCA
+
+Groups are well separated and replicates are close to each other. Also the variance was well captured by the first two components.
+
+With rlog-transformation.
+
+```{r count_PCA_rlog, message=FALSE}
+plotPCA(rlogT, ntop = 500, intgroup = "condition") + 
+    theme_classic()
+```
+
+With vst.
+
+```{r count_PCA_vst, message=FALSE}
+plotPCA(vst(ddsTxi), ntop = 500, intgroup = "condition") + 
+    theme_classic()
+```
+
+Use vst-transformed and limma-processed data fro PCA. Now the replicates are much closer for control and GSK compared to unprocessed data above. 
+
+```{r count_PCA_vst_limma, message=FALSE}
+plotPCA(vsd2, ntop = 500, intgroup = "condition") + 
+    theme_classic()
+```
+
+#### sample-to-sample distance
+
+Replicates are closer.
+
+```{r heatmap_sample2sample, rlog}
+sampleDists = dist(t(assay(rlogT)))
+sampleDistMatrix = as.matrix(sampleDists)
+rownames(sampleDistMatrix) = paste(rlogT$condition, rlogT$batch, sep = "-")
+colnames(sampleDistMatrix) = NULL
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists, 
+         cols = colors)
+```
+
+#### Dispersion plot
+
+Show typical result. Overall good data quality.
+
+```{r count_dispersion}
+plotDispEsts(ddsTxi)
+```
+
+## Annotation
+
+Add gene symbol and name to DE results. Add EntrezID for downstream analysis.   
+
+```{r annotation, message=FALSE}
+annot_result = function(res) {
+    res$Symbol = mapIds(org.Hs.eg.db,
+                        keys = row.names(res),
+                        column = "SYMBOL",
+                        keytype = "ENSEMBL",
+                        multiVals = "first")
+    
+    res$GeneName = mapIds(org.Hs.eg.db,
+                        keys = row.names(res),
+                        column = "GENENAME",
+                        keytype = "ENSEMBL",
+                        multiVals = "first")
+
+    res$EntrezID = mapIds(org.Hs.eg.db,
+                        keys = row.names(res),
+                        column = "ENTREZID",
+                        keytype = "ENSEMBL",
+                        multiVals = "first")
+    res = res[, c(7, 8, 9, 1:6)]
+    return(res)
+}
+res_GSK = annot_result(res_GSK)
+res_DAC = annot_result(res_DAC)
+res_GSK = res_GSK[!is.na(res_GSK$Symbol), ]
+res_DAC = res_DAC[!is.na(res_DAC$Symbol), ]
+```
+`
+
+Top 10 significantly (padj < 0.05) up-regulated genes.
+
+```{r top_10_up_genes}
+print(res_GSK[res_GSK$padj < 0.05, ][1:10, c("Symbol", "GeneName", "log2FoldChange", "pvalue", "padj")])
+print(res_DAC[res_DAC$padj < 0.05, ][1:10, c("Symbol", "GeneName", "log2FoldChange", "pvalue", "padj")])
+print("Number of genes common to both drugs:")
+print(sum(res_GSK[1:10, ]$Symbol %in% res_DAC[1:10, ]$Symbol))
+```
+Top 10 significantly (padj < 0.05) down-regulated genes.
+
+```{r top_10_down_genes}
+print(tail(res_GSK[res_GSK$padj < 0.05, ], 10)[, c("Symbol", "GeneName", "log2FoldChange", "pvalue", "padj")])
+print(tail(res_DAC[res_DAC$padj < 0.05, ], 10)[, c("Symbol", "GeneName", "log2FoldChange", "pvalue", "padj")])
+print("Number of genes common to both drugs:")
+print(sum(tail(res_GSK[res_GSK$padj < 0.05, ], 10)$Symbol %in% 
+          tail(res_DAC[res_DAC$padj < 0.05,], 10)$Symbol))
+```
+Save the files.  
+
+```{r lfc_raw}
+write.table(res_GSK, "MV411_day4_GSK032_400nM_salmon_lfc.tsv",
+            sep = "\t", quote = FALSE)
+write.table(res_DAC, "MV411_day4_DAC_400nM_salmon_lfc.tsv",
+            sep = "\t", quote = FALSE)
+```
+
+## Interactive Volcano plot
+
+Hover the mouse over a point to see the gene symbol, fold change and -log10(padj).  
+
+```{r DE_volcano}
+plotVolcano = function(res_DE, condition) {
+                      ggplot(res_DE,
+                             aes(x = log2FoldChange,
+                                 y = -log10(padj),
+                                 label = Symbol,
+                                 color = ifelse(res_DE$padj < 0.05 & abs(res_DE$log2FoldChange) > 1,
+                                                    "yes", "not"))) +
+                      geom_point() + 
+                      labs(title = paste0(condition, " vs control"),
+                          xlab = "log2 fold change", 
+                          ylab = "-log10 adjusted p-value",
+                          color = "> 2-fold & padj < 0.05") +
+                      scale_color_manual(values = c("#56B4E9", "#D55E00")) +
+                      theme(plot.title = element_text(size = 12, hjust = 0.5),
+                            axis.title = element_text(size = 12),
+                            legend.position = "right")
+}                        
+plotGSK = plotVolcano(res_GSK, "GSK")
+ggplotly(plotGSK, tooltip = c("log2FoldChange", "-log10(padj)", "label"))
+```
+
+```{r volcano_DAC}
+plotDAC = plotVolcano(res_DAC, "DAC")
+ggplotly(plotDAC, tooltip = c("log2FoldChange", "-log10(padj)", "label"))
+```
+
+## Venn diagrams for up- and down-regulated genes
+
+There were more up-regulated genes than down-regulated genes.
+
+```{r venn}
+par(mfrow = c(1, 2))
+
+# Select genes with at least 2-fold changes and sort them decreasingly.
+DE_gene_GSK = res_GSK[abs(res_GSK$log2FoldChange) >= 1 & res_GSK$padj < 0.05, ]
+DE_gene_GSK = DE_gene_GSK[, c("Symbol", "EntrezID", "log2FoldChange")]
+DE_gene_GSK = DE_gene_GSK[!is.na(DE_gene_GSK$Symbol), ]
+DE_gene_GSK = DE_gene_GSK[order(-DE_gene_GSK$log2FoldChange), ]
+print(nrow(DE_gene_GSK))  # 3435 genes
+
+DE_gene_DAC = res_DAC[abs(res_DAC$log2FoldChange) >= 1 & res_DAC$padj < 0.05, ]
+DE_gene_DAC = DE_gene_DAC[, c("Symbol",  "EntrezID", "log2FoldChange")]
+DE_gene_DAC = DE_gene_DAC[!is.na(DE_gene_DAC$Symbol), ]
+DE_gene_DAC = DE_gene_DAC[order(-DE_gene_DAC$log2FoldChange), ]
+print(nrow(DE_gene_DAC))  # 4015 genes
+
+up_list = list(GSK = as.vector(DE_gene_GSK[DE_gene_GSK$log2FoldChange >= 1, ]$Symbol),
+               DAC = as.vector(DE_gene_DAC[DE_gene_DAC$log2FoldChange >= 1, ]$Symbol))
+print(sapply(names(up_list), function(x) length(up_list[[x]])))
+
+down_list = list(GSK = as.vector(DE_gene_GSK[DE_gene_GSK$log2FoldChange < 1, ]$Symbol),
+                 DAC = as.vector(DE_gene_DAC[DE_gene_DAC$log2FoldChange < 1, ]$Symbol))
+print(sapply(names(up_list), function(x) length(down_list[[x]])))
+
+ggvenn(up_list, 
+       fill_color = c("white", "white"),
+       stroke_size = 0.5,
+       set_name_size = 6) + 
+       ggtitle("Up-regulated genes") +
+       theme(plot.title = element_text(size = 16, hjust = 0.5))
+
+ggvenn(down_list, 
+       fill_color = c("white", "white"),
+       stroke_size = 0.5,
+       set_name_size = 6) + 
+       ggtitle("Down-regulated genes") +
+       theme(plot.title = element_text(size = 16, hjust = 0.5))
+```
+
+## Gene enrichment analysis
+
+### GO ontology
+
+Use [clusterProfiler](https://yulab-smu.top/biomedical-knowledge-mining-book/clusterprofiler-go.html) package. This package runs fgesa algorithm by default. 
+
+The following results appeared to indicate changes involving molecular interactions and cellular structures. The similarity in "Biological process" invoked by the two drugs was prominent. 
+
+#### GSK  
+
+```{r GO_GSK_MF}
+goPath = function(ont, gene) {
+                enrichGO(gene = gene,
+                        OrgDb = org.Hs.eg.db,
+                        keyType = "SYMBOL",
+                        ont = ont,
+                        pAdjustMethod = "BH",
+                        pvalueCutoff = 0.01,
+                        qvalueCutoff = 0.05)
+}
+
+# Molecular functions
+goGSK_MF = goPath("MF", DE_gene_GSK$Symbol)
+print(head(goGSK_MF$Description, 10))
+```
+
+```{r GO_GSK_BP}
+# Biological process
+goGSK_BP = goPath("BP", DE_gene_GSK$Symbol)
+print(head(goGSK_BP$Description, 10))
+```
+
+#### DAC  
+
+```{r GO_DAC_MF}
+# Molecular functions
+goDAC_MF = goPath("MF", DE_gene_DAC$Symbol)
+print(head(goDAC_MF$Description, 10))
+```
+
+```{r GO_DAC_BP}
+# Biological process
+goDAC_BP = goPath("BP", DE_gene_DAC$Symbol)
+print(head(goDAC_BP$Description, 10))
+```
+
+plot the "Biological Process" network.
+
+```{r goGSK_BP, warning=FALSE}
+goplot(goGSK_BP, showCategory = 5)
+```
+
+```{r goDAC_BP, warning=FALSE}
+goplot(goDAC_BP, showCategory = 5)
+```
+
+### MSigDb gene set enrichment analysis
+
+```{r fgesa_function}
+gesaPath = function(gene_set, DE_genes, nPermSimple = 10000) {
+                pathways = gmtPathways(gene_set)
+                ranks = DE_genes$log2FoldChange
+                names(ranks) = DE_genes$EntrezID
+                gesa_result = fgsea(pathways = pathways, 
+                                    stats = ranks,
+                                    minSize = 15,
+                                    maxSize = 500,
+                                    nPermSimple = nPermSimple)
+                return(gesa_result)
+}
+```
+
+#### GSK
+
+Curated (C2) pathways.  
+
+Result includes Many cancer- and methylation-related pathways.  
+
+```{r c2_GSK, warning = FALSE}
+c2_gene_set = "gmt-file/c2.all.v2024.1.Hs.entrez.gmt"  # Path to gmt file
+c2_GSK = gesaPath(c2_gene_set, DE_gene_GSK)
+
+c2_top10_up = c2_GSK[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(c2_top10_up)
+
+c2_top10_down = c2_GSK[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(c2_top10_down)
+```
+
+```{r enrichment_plot_c2_GSK}
+rank_GSK = DE_gene_GSK$log2FoldChange
+names(rank_GSK) = DE_gene_GSK$EntrezID
+c2_pathways = gmtPathways(c2_gene_set)
+
+plotEnrichment(c2_pathways[["ZHONG_RESPONSE_TO_AZACITIDINE_AND_TSA_UP"]], rank_GSK) +
+            labs(title = "RESPONSE_TO_AZACITIDINE_AND_TSA_UP genes")
+```
+
+Hallmark pathways.
+
+```{r hallmark_GSK, warning=FALSE}
+h_gene_set = "gmt-file/h.all.v2024.1.Hs.entrez.gmt"
+h_GSK = gesaPath(h_gene_set, DE_gene_GSK)
+
+h_top10_up = h_GSK[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(h_top10_up)
+
+h_top10_down = h_GSK[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(h_top10_down)
+```
+
+Reactome pathways.
+
+```{r reactome_GSK, warning=FALSE}
+reactome_set = "gmt-file/c2.cp.reactome.v2024.1.Hs.entrez.gmt"
+react_GSK = gesaPath(reactome_set, DE_gene_GSK)
+
+react_top10_up = react_GSK[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(react_top10_up)
+
+react_top10_down = react_GSK[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(react_top10_down)
+```
+
+```{r enrichment_plot_reactome_GSK}
+react_pathways = gmtPathways(reactome_set)
+
+plotEnrichment(react_pathways[["REACTOME_HDACS_DEACETYLATE_HISTONES"]], rank_GSK) +
+            labs(title = "REACTOME_HDACS_DEACETYLATE_HISTONES genes")
+```
+
+#### DAC
+
+Curated (C2) pathways.
+
+Similar response to GSK.
+
+```{r c2_DAC, warning = FALSE}
+c2_gene_set = "gmt-file/c2.all.v2024.1.Hs.entrez.gmt"  # Path to gmt file
+c2_DAC = gesaPath(c2_gene_set, DE_gene_DAC)
+
+c2_top10_up = c2_DAC[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(c2_top10_up)
+
+c2_top10_down = c2_DAC[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(c2_top10_down)
+```
+
+```{r enrichment_plot_c2_DAC}
+rank_DAC = DE_gene_DAC$log2FoldChange
+names(rank_DAC) = DE_gene_DAC$EntrezID
+
+plotEnrichment(c2_pathways[["ZHONG_RESPONSE_TO_AZACITIDINE_AND_TSA_UP"]], rank_DAC) +
+            labs(title = "RESPONSE_TO_AZACITIDINE_AND_TSA_UP genes")
+```
+
+Hallmark pathways.
+
+```{r hallmark_DAC, warning=FALSE}
+h_gene_set = "gmt-file/h.all.v2024.1.Hs.entrez.gmt"
+h_DAC = gesaPath(h_gene_set, DE_gene_DAC)
+
+h_top10_up = h_DAC[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(h_top10_up)
+
+h_top10_down = h_DAC[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(h_top10_down)
+```
+
+Reactome pathways.
+
+```{r reactome_DAC, warning=FALSE}
+reactome_set = "gmt-file/c2.cp.reactome.v2024.1.Hs.entrez.gmt"
+react_DAC = gesaPath(reactome_set, DE_gene_DAC)
+
+react_top10_up = react_DAC[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(react_top10_up)
+
+react_top10_down = react_DAC[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(react_top10_down)
+```
+
+```{r enrichment_plot_reactome_DAC}
+plotEnrichment(react_pathways[["REACTOME_HDACS_DEACETYLATE_HISTONES"]], rank_DAC) +
+            labs(title = "REACTOME_HDACS_DEACETYLATE_HISTONES genes")
+```
+
+## Interactive figure for exploration
+
+Interactive figures with a dynamic data table.  
+
+See [Glimma](https://bioconductor.org/packages/release/bioc/vignettes/Glimma/inst/doc/DESeq2.html) vignette for instruction.
+
+```{r glimma}
+glimmaMA(ddsTxi, groups = ddsTxi$condition)
+```
+
+## Conclusion  
+
+Together with accompanying shell scripts, we demonstrated the process of obtaining Salmon quantification count of selected bulk RNA-seq reads, and using the count matrix for differential expression and pathway analysis. The count matrix we processed was about 2/3 of that from NCBI raw count, but overall the results were consistent.
+
+## Resources
+
+Love MI, et al. Analyzing RNA-seq data with DESeq2. https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+
+Akalin, A. Computational Genomics with R, Chapter 8, RNA-seq analysis.
+https://compgenomr.github.io/book/rnaseqanalysis.html  
+
+Gu Y, et al. Biomedical Knowledge Mining using GOSemSim and clusterProfiler. Part II: Enrichment analysis. https://yulab-smu.top/biomedical-knowledge-mining-book/enrichment-overview.html   
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

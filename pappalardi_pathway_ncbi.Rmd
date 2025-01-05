@@ -1,0 +1,795 @@
+---
+title: "RNA-seq pathway analysis using NCBI raw count and DESeq2"
+author: "Wenshu Chen"
+date: "2025-1-5"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(bitmapType="cairo")
+```
+
+This is a practice of RNA-seq pathway analysis using a small portion (6 out of 156) of GEO [GSE135378](https://www.ncbi.nlm.nih.gov/gds/?term=GSE135378[Accession]) dataset. Differential expression analysis was done with DESeq2. Pathway analyses were performed for GO ontology and MSigDb gene sets. 
+
+Related paper: 
+Pappalardi MB, et al. https://doi.org/10.1038/s43018-021-00249-x
+
+The paper describes the discovery and systematic characterization of a novel small molecule DNA methyltransferase (DNMT) 1 inhibitor GSK3685032 and its anti-tumor activity in acute myeloid leukemia cell lines. Decitabine (DAC), a nucleoside analog and classic non-specific DNMT inhibitor, was used for comparison of the effects on DNA demethylation, transcription changes, DNA damage, and tumor inhibitory activity but not on specific gene expression. 
+
+In this exercise, we used NCBI-processed raw count. From [NCBI](https://www.ncbi.nlm.nih.gov/geo/info/rnaseqcounts.html):
+
+Briefly, SRA runs where the organism is Homo sapiens and type is Transcriptomic are aligned to genome assembly GCA_000001405.15 using HISAT2. Runs that pass a 50% alignment rate are further processed with Subread featureCounts which outputs a raw count file for each run. For Human data, the Homo sapiens Annotation Release 109.20190905 was used for gene annotation. GEO further processes these SRR raw count files into GEO Series raw counts matrices. ... In cases where there is more than one SRA run per GEO Sample, the raw counts are summed.
+
+The dataset used here was from leukemia-derived macrophage cell line MV4-11 cells treated with 400 nM decitabine (DAC) or GSK3685032 (GSK in short hereafter) for 4 days together with vehicle (DMSO) control. In original data, each treatment has two set of replicates, each of which includes six samples (six SRRs). The NCBI raw count matrix has six count columns for these samples, two for each condition (DMSO, GSK, and DAC) with corresponding GSM numbers as column names.
+
+The results were consistent with broad effects of DNA demethylation. However, this is a technical practice not aiming to reproduce the original analyses or draw any biological insights.
+
+
+#### Load the libraries.
+
+```{r library, message=FALSE, warning=FALSE}
+library(GEOquery)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(DESeq2)
+library(apeglm)
+library(EDASeq)
+library(limma)
+library(clusterProfiler)
+library(fgsea)
+library(msigdbr)
+library(ReactomePA)
+library(vsn)
+library(hexbin)
+library(pheatmap)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(RColorBrewer)
+library(Glimma)
+library(ggvenn)
+library(plotly)
+```
+
+## Data preparation
+
+#### Dataset download
+
+First, we download the NCBI raw count data and the parent GEO files for sample information.
+
+Note:  
+1. GeneID (ENTREZID) are numbers;   
+2. Sample names are GSM*([0-9]) from GEO, not the actual sample names. 
+
+Also download [MSigDB gene set](https://www.gsea-msigdb.org/gsea/msigdb) set for pathway analysis. (Have to download manually from the website using an account).  
+
+```{r ncbi_count, message=FALSE}
+# setwd("/N/slate/wenschen/pappa-paper")
+
+# NCBI raw count data
+url = "https://www.ncbi.nlm.nih.gov/geo/download/?type=rnaseq_counts&acc=GSE135378&format=file&file=GSE135378_raw_counts_GRCh38.p13_NCBI.tsv.gz"
+download.file(url, destfile = "GSE135378_raw_counts_GRCh38.p13_NCBI.tsv.gz")
+gunzip("GSE135378_raw_counts_GRCh38.p13_NCBI.tsv.gz")
+
+# MSigDB gene sets (https://www.gsea-msigdb.org/gsea/msigdb)
+# Curated set
+# url = "https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2024.1.Hs/c2.all.v2024.1.Hs.entrez.gmt"
+
+# # Hallmark set
+# url = "https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2024.1.Hs/h.all.v2024.1.Hs.entrez.gmt"
+
+# Reactome CP
+#url = "https://www.gsea-msigdb.org/gsea/msigdb/download_file.jsp?filePath=/msigdb/release/2024.1.Hs/c2.cp.wikipathways.v2024.1.Hs.entrez.gmt"
+
+raw = read.table("GSE135378_raw_counts_GRCh38.p13_NCBI.tsv", header = TRUE)
+print(dim(raw))  # 39376 157
+print(head(raw)[, 1:10])
+```
+
+We need to download the parent file for metadata.
+
+```{r GSE_matrix}
+data_matrix = getGEO(GEO = "GSE135378", destdir = ".", GSEMatrix = TRUE, getGPL = FALSE)
+```
+
+#### Sample info
+
+Prepare a sample info file for the count table, and a easy-to-read sample table for reference (can also be used for selecting data).
+
+```{r sample_info, message=FALSE, warning=FALSE}
+## file for count columns
+sample_info = pData(phenoData(data_matrix[[1]]))[, c(1, 1)][1]
+sample_info = data.frame(sample_info)
+colnames(sample_info) = "details"
+sample_info$details = sapply(sample_info, function(x) sub(" \\[.*", "", x))
+write.table(sample_info, "sample_info.txt", 
+            col.names = FALSE, quote = FALSE, sep = "\t")
+
+## table
+# Remove the "." in "3.2nM" for next step.
+# Name the columns accordingly.
+sample_info$details = sapply(sample_info$details, 
+                             function(x) sub("3.2", "32", x, fixed = TRUE))
+sample_info = cbind(rownames(sample_info), 
+                    data.frame(str_split_fixed(sample_info$details, "\\.", 5)))
+colnames(sample_info) = c("GSM", "cell_line", "dose", "drug", "day", "replicate")
+# Get the "." back for "3.2nM".
+sample_info$dose = as.numeric(gsub("nM", "", sample_info$dose))
+sample_info$dose = sapply(sample_info$dose, function(x) ifelse(x == "32", "3.2", x))
+sample_info$day = as.numeric(gsub("d", "", sample_info$day))
+sample_info$replicate = as.numeric(gsub("n", "", sample_info$replicate))
+# Rearrange the columns.
+sample_info = sample_info[, c("GSM", "cell_line", "drug", "dose", "day", "replicate")]
+write.table(sample_info, "sample_info_table.txt", 
+            row.names = FALSE, quote = FALSE, sep = "\t")
+print(head(sample_info))
+```
+
+#### Prepare a small dataset
+
+Only MV4-11, day4, DMSO, and 400 nM GSK or DAC treatment.  
+
+About the cell line (from [ATCC](https://www.atcc.org/products/crl-9591)):  
+
+MV-4-11 cells are macrophages that were isolated from the blast cells of a 10-year-old male with biphenotypic B-myelomonocytic leukemia and deposited by the Wistar Institute. Use these cells in cancer and immunology research.   
+
+```{r replacing_colnames}
+sample_df = read.table("sample_info.txt")
+colnames(sample_df) = c("GSM", "details")
+
+## Check the corresponding names to make sure they match.
+# The first column of data is GeneID.
+# Total sample number is 156.
+nrow(sample_df) == ncol(raw) - 1  # True
+all(sample_df$GSM == colnames(raw)[2:157]) # True 
+print(sum(sample_df$GSM == colnames(raw)[2:157]))  # 156
+
+## Replace and save.
+colnames(raw)[2:157] = sample_df$details
+# Take a look.
+print(head(raw)[, 1:5])
+# Save the file.
+write.table(raw, "GSE135378_raw_counts_GRCh38.p13_NCBI_renamed.tsv",
+            row.names = FALSE, quote = FALSE, sep = "/t")
+
+# Make a smaller table with the data of interest for next step.
+# Day 4, MV4-11, for the Venn diagram in Fig. 6c from the paper.
+cols_mv4d4 = grep("MV411", colnames(raw), value = TRUE) 
+cols_mv4d4 = grep("d4", cols_mv4d4, value = TRUE)
+mv4d4_raw = raw[, c("GeneID", cols_mv4d4)]
+print(head(mv4d4_raw)[, 1:5])
+
+# Let's make a smaller dataset: 400 nM and control only.
+cols_mv4d4_400 = grepl("DMSO", colnames(mv4d4_raw)) | grepl("400nM", colnames(mv4d4_raw))
+mv4d4_400_raw = cbind(GeneID = mv4d4_raw[, "GeneID"], mv4d4_raw[, c(cols_mv4d4_400)])
+print(dim(mv4d4_400_raw))  # 39376 7
+print(head(mv4d4_400_raw))
+
+# Now we only have 6 samples, let's simplify the columns names.
+print(colnames(mv4d4_400_raw))
+# [1] "GeneID" "MV411.0nM.DMSO.d4.n1"     "MV411.400nM.GSK032.d4.n1" "MV411.400nM.DAC.d4.n1"   
+# [4] "MV411.0nM.DMSO.d4.n2"     "MV411.400nM.GSK032.d4.n2" "MV411.400nM.DAC.d4.n2" 
+colnames(mv4d4_400_raw) = c("GeneID", "DMSO_1", "GSK_1", "DAC_1", "DMSO_2", "GSK_2", "DAC_2")
+mv4d4_400_raw2 = mv4d4_400_raw  # Make a copy just in case
+# Arrange the columns
+mv4d4_400_raw = mv4d4_400_raw[, c("GeneID", "DMSO_1", "DMSO_2", "DAC_1",  "DAC_2", "GSK_1", "GSK_2")]
+print(colnames(mv4d4_400_raw))
+write.table(mv4d4_400_raw, "MV4-11_raw_counts_NCBI_d4_400nm.tsv",
+            row.names = FALSE, quote = FALSE, sep = "\t")
+```
+
+#### Creating a sample table for DESeq
+
+Sample names as index (row name);  
+Condition(treatment) as level for comparison.
+
+```{r DESeq_samples}
+sample_table = data.frame(condition = c("DMSO", "DMSO", "DAC", "DAC", "GSK", "GSK"))
+rownames(sample_table) = colnames(mv4d4_400_raw[2:7])
+sample_table$condition = as.factor(sample_table$condition)
+sample_table$batch = as.factor(str_split_i(rownames(sample_table), "_", 2))
+print(sample_table)
+```
+
+#### create DESeq dataset object
+
+First, construct a DESeq dataset from the count matrix, sample table, and set the comparison condition. Include batch in the design formula.  
+
+```{r dataset}
+# Construct the count matrix. Same as above, but remove the gene ID column name.
+count_matrix = mv4d4_400_raw[, 2:7]
+rownames(count_matrix) = mv4d4_400_raw[, 1]
+print(head(count_matrix))
+
+# Make sure sample_table row names = column (sample) names of the matrix.
+all(colnames(count_matrix) == rownames(sample_table))  # True
+
+# Now we can create the DESeq dataset object, adding batch into design.
+dds = DESeqDataSetFromMatrix(countData = count_matrix,
+                             colData = sample_table,
+                             design = ~ batch + condition)
+print(dds)
+```
+
+#### Filtering read count
+
+Filter the counts, removing low counts as recommended by the authors of DESeq.
+
+```{r filtering_count}
+# We have 3 conditions, each with two replicates. 
+# Note that original authors set a much looser criterion (>= 2 reads) even with more samples.
+keep = rowSums(counts(dds) >= 10) >= 2
+sum(keep)  # 21700
+# Total rows: 39376, so 39376 - 21700 = 17676 removed.
+dds = dds[keep, ]
+```
+
+## Differential expression analysis
+
+#### DESeq task
+
+```{r DE}
+# Tell DESeq the reference level (control).
+# First check the condition.
+print(dds$condition)
+print(dds$batch)
+# DMSO DMSO DAC  DAC  GSK  GSK 
+# Levels: DAC DMSO GSK
+
+# Set the condition.
+dds$condition= factor(dds$condition, levels = c("DMSO", "DAC", "GSK"))
+print(dds$condition)
+
+# Generate the log fold change table.
+dds = DESeq(dds)
+print(dds)
+```
+
+#### Get the results for GSK and DAC
+
+Significance level set to 0.05 as that from original authors.
+
+```{r result}
+res_GSK = results(dds, contrast = c("condition", "GSK", "DMSO"), alpha = 0.05)
+# Sort the rows by fold change.
+res_GSK = res_GSK[order(res_GSK$log2FoldChange, decreasing = TRUE), ]
+print(summary(res_GSK))
+```
+
+```{r}
+res_DAC = results(dds, contrast = c("condition", "DAC", "DMSO"), alpha = 0.05)
+# Sort the rows by fold change.
+res_DAC = res_DAC[order(res_DAC$log2FoldChange, decreasing = TRUE), ]
+print(summary(res_DAC))
+```
+
+#### Log fold change shrinkage
+
+For visualization and ranking according to DESeq authors.
+
+```{r log_fold_shrinkage, message=FALSE}
+lfcShrink_GSK = lfcShrink(dds, coef = "condition_GSK_vs_DMSO", type = "apeglm")
+lfcShrink_DAC = lfcShrink(dds, coef = "condition_DAC_vs_DMSO", type = "apeglm")
+```
+
+## Quality plots  
+
+We look at some plots for data quality. 
+
+#### MA-plot
+
+Most of the points (genes) are expected to be around the horizontal 0 line. True.
+
+```{r MA-plot_GSK}
+DESeq2::plotMA(lfcShrink_GSK, ylim = c(-3, 3))
+```
+
+```{r MA-plot_DAC}
+DESeq2::plotMA(lfcShrink_DAC, ylim = c(-3, 3))
+```
+#### P-value distribution
+
+Show expected results. 
+
+```{r pvalue}
+par(mfrow = c(1, 2))
+
+ggplot(res_GSK, aes(x = pvalue)) + geom_histogram(bins = 100) +
+    ggtitle("Distribution of raw p values") +
+    theme_classic()
+
+ggplot(res_DAC, aes(x = padj)) + geom_histogram(bins = 100) +
+        ggtitle("Distribution of raw p values") + 
+        theme_classic()
+```
+
+#### Raw and normalized counts
+
+Relative log expression plots. Normalization worked well.
+
+```{r RLE_plot}
+EDASeq::plotRLE(counts(dds), 
+        outline = FALSE, 
+        col = colData(dds)$condition,
+        ylim = c(-3, 3),
+        main = "Raw Counts")
+EDASeq::plotRLE(counts(dds, normalized = TRUE), 
+        outline = FALSE, 
+        col = colData(dds)$condition,
+        ylim = c(-3, 3),
+        main = "Normalized Counts")
+```
+
+#### Heatmaps of transformed count matrix
+
+Replicates have variations with a pattern that seems to suggest batch effect, but overall they were clustered together. 
+
+Normalized counts.
+
+```{r heatmap, normTransform}
+select = order(rowMeans(counts(dds, normalized = TRUE)), decreasing = TRUE)[1:100]
+col_df <- data.frame(colData(dds))["condition"]
+pheatmap(assay(normTransform(dds))[select, ], scale = "row", 
+         cluster_rows = FALSE, show_rownames = FALSE,
+         annotation_col = col_df)
+```
+
+Counts with regularized log transformation(rlog).
+
+```{r heatmap, rlog_transformation}
+# Regularized log transformation(rlog)
+rlogT = rlog(dds)
+pheatmap(assay(rlogT)[select, ], scale = "row", 
+         cluster_rows = FALSE, show_rownames = FALSE,
+         annotation_col = col_df)
+```
+
+Counts with variance_stabilizing transformation(vst).
+
+```{r heatmap, vst_transformation}
+# Regularized log transformation(rlog)
+vsd = vst(dds)
+pheatmap(assay(vsd)[select, ], scale = "row", 
+         cluster_rows = FALSE, show_rownames = FALSE,
+         annotation_col = col_df)
+```
+
+Use limma removeBatchBatchEffect to see if batch effect indeed exists.
+
+Hard to tell here, but clearer look at the PCA plot below.
+
+```{r batch_effect, with_limma}
+vsd2 = vsd
+mat = assay(vsd2)
+mmatrix = model.matrix(~ condition, colData(vsd2))
+mat = removeBatchEffect(mat, batch = vsd2$batch, design = mmatrix)
+assay(vsd2) = mat
+pheatmap(assay(vsd2)[select, ], scale = "row", 
+         cluster_rows = FALSE, show_rownames = FALSE,
+         annotation_col = col_df)
+```
+
+#### Count PCA
+
+Groups are well separated and replicates are close to each other. Also the variance was well captured by the first two components.
+
+With rlog-transformation.
+
+```{r count_PCA_rlog, message=FALSE}
+plotPCA(rlogT, ntop = 500, intgroup = "condition") + 
+    theme_classic()
+```
+
+With vst.
+
+```{r count_PCA_vst, message=FALSE}
+plotPCA(vst(dds), ntop = 500, intgroup = "condition") + 
+    theme_classic()
+```
+
+Use vst-transformed and limma-processed data fro PCA. Now the replicates are much closer for control and GSK.
+
+```{r count_PCA_vst_limma, message=FALSE}
+plotPCA(vsd2, ntop = 500, intgroup = "condition") + 
+    theme_classic()
+```
+
+#### sample-to-sample distance
+
+Replicates are closer.
+
+```{r heatmap_sample2sample, rlog}
+sampleDists = dist(t(assay(rlogT)))
+sampleDistMatrix = as.matrix(sampleDists)
+rownames(sampleDistMatrix) = paste(rlogT$condition, rlogT$batch, sep = "-")
+colnames(sampleDistMatrix) = NULL
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists, 
+         cols = colors)
+```
+
+#### Dispersion plot
+
+Show typical result. Overall the data quality is good.
+
+```{r count_dispersion}
+plotDispEsts(dds)
+```
+
+## Annotation
+
+Add gene symbol and name to the results.
+
+```{r annotation, message=FALSE}
+annot_result = function(res) {
+    res$Symbol = mapIds(org.Hs.eg.db,
+                        keys = row.names(res),
+                        column = "SYMBOL",
+                        keytype = "ENTREZID",
+                        multiVals = "first")
+    
+    res$GeneName = mapIds(org.Hs.eg.db,
+                            keys = row.names(res),
+                            column = "GENENAME",
+                            keytype = "ENTREZID",
+                            multiVals = "first")
+    res = res[, c(7, 8, 1:6)]
+    return(res)
+}
+res_GSK = annot_result(res_GSK)
+res_DAC = annot_result(res_DAC)
+```
+
+
+About the matching of EntrezID and Symbol:
+
+We would get quite a few NAs (~ 3%) in Symbol column:
+
+```{r na_symbol}
+print(nrow(res_GSK[is.na(res_DAC$Symbol), ]))
+print(nrow(res_DAC[is.na(res_DAC$Symbol), ]))
+```
+
+This is because NCBI withdrew or replaced these EntrezIDs. So we can safely remove those entries.
+
+```{r na_symbol_rm}
+res_GSK = res_GSK[!is.na(res_DAC$Symbol), ]
+res_DAC = res_DAC[!is.na(res_DAC$Symbol), ]
+
+print(dim(res_GSK))
+print(dim(res_DAC))
+```
+
+Top 10 significantly (padj < 0.05) up-regulated genes.
+
+```{r top_10_up_genes}
+print(res_GSK[res_GSK$padj < 0.05, ][1:10, c("Symbol", "GeneName", "log2FoldChange", "pvalue", "padj")])
+print(res_DAC[res_DAC$padj < 0.05, ][1:10, c("Symbol", "GeneName", "log2FoldChange", "pvalue", "padj")])
+print("Number of genes common to both drugs:")
+print(sum(res_GSK[1:10, ]$Symbol %in% res_DAC[1:10, ]$Symbol))
+```
+Top 10 significantly (padj < 0.05) down-regulated genes.
+
+```{r top_10_down_genes}
+print(tail(res_GSK[res_GSK$padj < 0.05, ], 10)[, c("Symbol", "GeneName", "log2FoldChange", "pvalue", "padj")])
+print(tail(res_DAC[res_DAC$padj < 0.05, ], 10)[, c("Symbol", "GeneName", "log2FoldChange", "pvalue", "padj")])
+print("Number of genes common to both drugs:")
+print(sum(tail(res_GSK[res_GSK$padj < 0.05, ], 10)$Symbol %in% 
+          tail(res_DAC[res_DAC$padj < 0.05,], 10)$Symbol))
+```
+Save the files.
+
+```{r lfc_raw}
+write.table(res_GSK, "MV411_day4_GSK032_400nM_NCBI_count_lfc.tsv",
+            sep = "\t", quote = FALSE)
+write.table(res_DAC, "MV411_day4_DAC_400nM_NCBI_count_lfc.tsv",
+            sep = "\t", quote = FALSE)
+```
+
+## Interactive Volcano plot
+
+Hover the mouse over a point to see the gene symbol, fold change and -log10(padj).  
+
+```{r DE_volcano}
+plotVolcano = function(res_DE, condition) {
+                      ggplot(res_DE,
+                             aes(x = log2FoldChange,
+                                 y = -log10(padj),
+                                 label = Symbol,
+                                 color = ifelse(res_DE$padj < 0.05 & abs(res_DE$log2FoldChange) > 1,
+                                                    "yes", "not"))) +
+                      geom_point() + 
+                      labs(title = paste0(condition, " vs control"),
+                          xlab = "log2 fold change", 
+                          ylab = "-log10 adjusted p-value",
+                          color = "> 2-fold & padj < 0.05") +
+                      scale_color_manual(values = c("#56B4E9", "#D55E00")) +
+                      theme(plot.title = element_text(size = 12, hjust = 0.5),
+                            axis.title = element_text(size = 12),
+                            legend.position = "right")
+}                        
+plotGSK = plotVolcano(res_GSK, "GSK")
+ggplotly(plotGSK, tooltip = c("log2FoldChange", "-log10(padj)", "label"))
+```
+
+```{r volcano_DAC}
+plotDAC = plotVolcano(res_DAC, "DAC")
+ggplotly(plotDAC, tooltip = c("log2FoldChange", "-log10(padj)", "label"))
+```
+
+
+## Venn diagrams for up- and down-regulated genes
+
+There were more up-regulated genes than down-regulated genes. 
+
+```{r venn}
+par(mfrow = c(1, 2))
+
+# Select genes with 2-fold changes and sort them decreasingly.
+DE_gene_GSK = res_GSK[abs(res_GSK$log2FoldChange) >= 1 & res_GSK$padj < 0.05, ]
+DE_gene_GSK = DE_gene_GSK[, c("Symbol", "log2FoldChange", "padj")]
+DE_gene_GSK = DE_gene_GSK[!is.na(DE_gene_GSK$Symbol), ]
+DE_gene_GSK = DE_gene_GSK[order(-DE_gene_GSK$log2FoldChange), ]
+print(nrow(DE_gene_GSK))  # 3435 genes
+
+DE_gene_DAC = res_DAC[abs(res_DAC$log2FoldChange) >= 1 & res_DAC$padj < 0.05, ]
+DE_gene_DAC = DE_gene_DAC[, c("Symbol", "log2FoldChange", "padj")]
+DE_gene_DAC = DE_gene_DAC[!is.na(DE_gene_DAC$Symbol), ]
+DE_gene_DAC = DE_gene_DAC[order(-DE_gene_DAC$log2FoldChange), ]
+print(nrow(DE_gene_DAC))  # 4015 genes
+
+up_list = list(GSK = as.vector(DE_gene_GSK[DE_gene_GSK$log2FoldChange >= 1, ]$Symbol),
+               DAC = as.vector(DE_gene_DAC[DE_gene_DAC$log2FoldChange >= 1, ]$Symbol))
+print(sapply(names(up_list), function(x) length(up_list[[x]])))
+
+down_list = list(GSK = as.vector(DE_gene_GSK[DE_gene_GSK$log2FoldChange < 1, ]$Symbol),
+                 DAC = as.vector(DE_gene_DAC[DE_gene_DAC$log2FoldChange < 1, ]$Symbol))
+print(sapply(names(up_list), function(x) length(down_list[[x]])))
+
+ggvenn(up_list, 
+       fill_color = c("white", "white"),
+       stroke_size = 0.5,
+       set_name_size = 6) + 
+       ggtitle("Up-regulated genes") +
+       theme(plot.title = element_text(size = 16, hjust = 0.5))
+
+ggvenn(down_list, 
+       fill_color = c("white", "white"),
+       stroke_size = 0.5,
+       set_name_size = 6) + 
+       ggtitle("Down-regulated genes") +
+       theme(plot.title = element_text(size = 16, hjust = 0.5))
+```
+
+## Gene enrichment analysis
+
+### GO ontology
+
+Use [clusterProfiler](https://yulab-smu.top/biomedical-knowledge-mining-book/clusterprofiler-go.html) package. This package runs fgesa algorithm by default.
+
+The following results appeared to indicate changes involving molecular interactions and cellular structures. The similarity in "Biological process" invoked by the two drugs was prominent.  
+
+#### GSK  
+
+```{r GO_GSK_MF}
+goPath = function(ont, gene) {
+                enrichGO(gene = gene,
+                        OrgDb = org.Hs.eg.db,
+                        keyType = "SYMBOL",
+                        ont = ont,
+                        pAdjustMethod = "BH",
+                        pvalueCutoff = 0.01,
+                        qvalueCutoff = 0.05)
+}
+
+# Molecular functions
+goGSK_MF = goPath("MF", DE_gene_GSK$Symbol)
+print(head(goGSK_MF$Description, 10))
+```
+
+```{r GO_GSK_BP}
+# Biological process
+goGSK_BP = goPath("BP", DE_gene_GSK$Symbol)
+print(head(goGSK_BP$Description, 10))
+```
+
+#### DAC  
+
+```{r GO_DAC_MF}
+# Molecular functions
+goDAC_MF = goPath("MF", DE_gene_DAC$Symbol)
+print(head(goDAC_MF$Description, 10))
+```
+
+```{r GO_DAC_BP}
+# Biological process
+goDAC_BP = goPath("BP", DE_gene_DAC$Symbol)
+print(head(goDAC_BP$Description, 10))
+```
+
+plot the "Biological Process" network. (Hard to customize the figure, so as is)
+
+```{r goGSK_BP, warning=FALSE}
+goplot(goGSK_BP, showCategory = 5)
+```
+
+```{r goDAC_BP, warning=FALSE}
+goplot(goDAC_BP, showCategory = 5)
+```
+
+### MSigDb gene set enrichment analysis
+
+```{r fgesa_function}
+gesaPath = function(gene_set, DE_genes, nPermSimple = 10000) {
+                pathways = gmtPathways(gene_set)
+                ranks = DE_genes$log2FoldChange
+                names(ranks) = rownames(DE_genes)
+                gesa_result = fgsea(pathways = pathways, 
+                                    stats = ranks,
+                                    minSize = 15,
+                                    maxSize = 500,
+                                    nPermSimple = nPermSimple)
+                return(gesa_result)
+}
+```
+
+#### GSK
+
+Curated (C2) pathways.  
+
+Result includes Many cancer- and methylation-related pathways.  
+
+```{r c2_GSK, warning = FALSE}
+c2_gene_set = "gmt-file/c2.all.v2024.1.Hs.entrez.gmt"  # Path to gmt file
+c2_GSK = gesaPath(c2_gene_set, DE_gene_GSK)
+
+c2_top10_up = c2_GSK[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(c2_top10_up)
+
+c2_top10_down = c2_GSK[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(c2_top10_down)
+```
+
+```{r enrichment_plot_c2_GSK}
+rank_GSK = DE_gene_GSK$log2FoldChange
+names(rank_GSK) = rownames(DE_gene_GSK)
+c2_pathways = gmtPathways(c2_gene_set)
+
+plotEnrichment(c2_pathways[["ZHONG_RESPONSE_TO_AZACITIDINE_AND_TSA_UP"]], rank_GSK) +
+            labs(title = "RESPONSE_TO_AZACITIDINE_AND_TSA_UP genes")
+```
+
+Hallmark pathways.
+
+Metabolic alteration, DNA repair and immune responses.
+
+```{r hallmark_GSK, warning=FALSE}
+h_gene_set = "gmt-file/h.all.v2024.1.Hs.entrez.gmt"
+h_GSK = gesaPath(h_gene_set, DE_gene_GSK)
+
+h_top10_up = h_GSK[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(h_top10_up)
+
+h_top10_down = h_GSK[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(h_top10_down)
+```
+
+Reactome pathways.
+
+```{r reactome_GSK, warning=FALSE}
+reactome_set = "gmt-file/c2.cp.reactome.v2024.1.Hs.entrez.gmt"
+react_GSK = gesaPath(reactome_set, DE_gene_GSK)
+
+react_top10_up = react_GSK[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(react_top10_up)
+
+react_top10_down = react_GSK[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(react_top10_down)
+```
+
+```{r enrichment_plot_reactome_GSK}
+react_pathways = gmtPathways(reactome_set)
+
+plotEnrichment(react_pathways[["REACTOME_DNA_METHYLATION"]], rank_GSK) +
+            labs(title = "REACTOME_DNA_METHYLATION genes")
+```
+
+#### DAC
+
+Curated (C2) pathways.
+
+Similar responses to GSK.
+
+```{r c2_DAC, warning = FALSE}
+c2_gene_set = "gmt-file/c2.all.v2024.1.Hs.entrez.gmt"  # Path to gmt file
+c2_DAC = gesaPath(c2_gene_set, DE_gene_DAC)
+
+c2_top10_up = c2_DAC[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(c2_top10_up)
+
+c2_top10_down = c2_DAC[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(c2_top10_down)
+```
+
+```{r enrichment_plot_c2_DAC}
+rank_DAC = DE_gene_DAC$log2FoldChange
+names(rank_DAC) = rownames(DE_gene_DAC)
+
+plotEnrichment(c2_pathways[["ZHONG_RESPONSE_TO_AZACITIDINE_AND_TSA_UP"]], rank_DAC) +
+            labs(title = "RESPONSE_TO_AZACITIDINE_AND_TSA_UP genes")
+```
+
+Hallmark pathways.
+
+```{r hallmark_DAC, warning=FALSE}
+h_gene_set = "gmt-file/h.all.v2024.1.Hs.entrez.gmt"
+h_DAC = gesaPath(h_gene_set, DE_gene_DAC)
+
+h_top10_up = h_DAC[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(h_top10_up)
+
+h_top10_down = h_DAC[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(h_top10_down)
+```
+
+Reactome pathways.
+
+```{r reactome_DAC, warning=FALSE}
+reactome_set = "gmt-file/c2.cp.reactome.v2024.1.Hs.entrez.gmt"
+react_DAC = gesaPath(reactome_set, DE_gene_DAC)
+
+react_top10_up = react_DAC[ES > 0][head(order(pval), 10), pathway]
+cat("Top ten up-regulated pathways:\n")
+print(react_top10_up)
+
+react_top10_down = react_DAC[ES < 0][head(order(pval), 10), pathway]
+cat("Top ten down-regulated pathways:\n")
+print(react_top10_down)
+```
+
+```{r enrichment_plot_reactome_DAC}
+plotEnrichment(react_pathways[["REACTOME_DNA_METHYLATION"]], rank_DAC) +
+            labs(title = "REACTOME_DNA_METHYLATION genes")
+```
+
+## Interactive figure for exploration
+
+Interactive figures with a dynamic data table.  
+
+See [Glimma](https://bioconductor.org/packages/release/bioc/vignettes/Glimma/inst/doc/DESeq2.html) vignette for instruction.
+
+```{r glimma}
+glimmaMA(dds, groups = dds$condition)
+```
+
+## Conclusion  
+
+We demonstrated the process of obtaining NCBI RNA-seq raw count, selecting dataset and using it for differential expression and pathway analysis. The results were consistent with DNA demethylation effects as expected.
+
+## Resources
+
+Love MI, et al. Analyzing RNA-seq data with DESeq2. https://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html
+
+Akalin, A. Computational Genomics with R, Chapter 8, RNA-seq analysis.
+https://compgenomr.github.io/book/rnaseqanalysis.html  
+
+Gu Y, et al. Biomedical Knowledge Mining using GOSemSim and clusterProfiler. Part II: Enrichment analysis. https://yulab-smu.top/biomedical-knowledge-mining-book/enrichment-overview.html   
+
+## Session info
+
+```{r session}
+sessionInfo()
+```
